@@ -1,0 +1,190 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_camera.h"
+#include "Config.h"
+
+// --------- 全局 ---------
+WebServer server(80);
+String uartInBuf;
+static const char* AP_SSID = "ESP32-CAM";     // 你也可以用 "OUR PARADISE"
+static const char* AP_PASS = "12345678";      // 至少8位
+
+struct Telemetry {
+  uint32_t ts_ms = 0;
+  int ultra_mm = -1;
+  int lineL = -1, lineM = -1, lineR = -1;
+  int cliff = -1;
+  float gz_dps = 0.0f;
+} telem;
+
+// --------- 摄像头初始化 ---------
+static bool init_camera() {
+  camera_config_t config = {};
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0 = CAM_PIN_D0;  config.pin_d1 = CAM_PIN_D1;
+  config.pin_d2 = CAM_PIN_D2;  config.pin_d3 = CAM_PIN_D3;
+  config.pin_d4 = CAM_PIN_D4;  config.pin_d5 = CAM_PIN_D5;
+  config.pin_d6 = CAM_PIN_D6;  config.pin_d7 = CAM_PIN_D7;
+  config.pin_xclk = CAM_PIN_XCLK; config.pin_pclk = CAM_PIN_PCLK;
+  config.pin_vsync = CAM_PIN_VSYNC; config.pin_href = CAM_PIN_HREF;
+  config.pin_sccb_sda = CAM_PIN_SIOD; config.pin_sccb_scl = CAM_PIN_SIOC;
+  config.pin_pwdn = CAM_PIN_PWDN; config.pin_reset = CAM_PIN_RESET;
+
+  config.xclk_freq_hz = CAM_XCLK_HZ;
+  config.pixel_format = PIXFORMAT_JPEG; // OV3660 支持 JPEG
+  config.frame_size   = CAM_FRAME_SIZE;
+  config.jpeg_quality = CAM_JPEG_QUALITY;
+  config.fb_count     = CAM_FB_COUNT;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("[camera] init failed 0x%x\n", err);
+    return false;
+  }
+  return true;
+}
+
+// --------- MJPEG 输出 ---------
+static const char* BOUNDARY = "123456789000000000000987654321";
+static void handle_mjpeg() {
+  WiFiClient client = server.client();
+
+  client.println("HTTP/1.1 200 OK");
+  client.print("Content-Type: multipart/x-mixed-replace; boundary=--");
+  client.println(BOUNDARY);
+  client.println("Connection: close");
+  client.println();
+
+  client.setTimeout(2000);
+
+  while (client.connected()) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) { delay(10); continue; }
+
+    client.print("--"); client.println(BOUNDARY);
+    client.println("Content-Type: image/jpeg");
+    client.print("Content-Length: "); client.println(fb->len);
+    client.println();
+    client.write(fb->buf, fb->len);
+    client.println();
+
+    esp_camera_fb_return(fb);
+    delay(5);
+  }
+}
+
+// --------- HTTP: / 与 /telemetry ---------
+static void handle_root() {
+  String html;
+  html += "<html><body><h3>ESP32 Camera Gateway</h3>";
+  html += "<p><a href='/mjpeg'>/mjpeg</a> (video) | <a href='/telemetry'>/telemetry</a></p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+static void handle_telemetry() {
+  String j = "{";
+  j += "\"ts\":" + String(telem.ts_ms) + ",";
+  j += "\"ultra_mm\":" + String(telem.ultra_mm) + ",";
+  j += "\"line\":{";
+  j += "\"L\":" + String(telem.lineL) + ",";
+  j += "\"M\":" + String(telem.lineM) + ",";
+  j += "\"R\":" + String(telem.lineR) + "},";
+  j += "\"cliff\":" + String(telem.cliff) + ",";
+  j += "\"imu\":{";
+  j += "\"gz_dps\":" + String(telem.gz_dps, 2) + "}}";
+  server.send(200, "application/json", j);
+}
+
+// --------- /cmd：下发到 UNO（补齐 '}' 作为帧结束） ---------
+static void handle_cmd() {
+  if (!server.hasArg("plain")) { server.send(400, "text/plain", "Missing body"); return; }
+  String body = server.arg("plain");
+  if (!body.endsWith("}")) body += "}";
+  Serial1.print(body);
+  server.send(200, "application/json", String("{\"ok\":true}"));
+}
+
+// --------- UART 读帧 + 轮询 ---------
+static void uartPollRead() {
+  while (Serial1.available()) {
+    char c = (char)Serial1.read();
+    uartInBuf += c;
+    if (c == '}') {
+      telem.ts_ms = millis();
+      // TODO: 在这里按你 UNO 的回传格式解析 ultra/line/cliff（可选）。
+      uartInBuf = "";
+    }
+  }
+}
+
+static unsigned long lastPollMs = 0;
+static void uartPeriodicPoll() {
+  unsigned long now = millis();
+  if (now - lastPollMs < 50) return; // 20Hz
+  lastPollMs = now;
+  Serial1.print("{\"N\":21}"); // ultrasonic
+  Serial1.print("{\"N\":22}"); // line sensors
+  Serial1.print("{\"N\":23}"); // cliff
+  // 若在 UNO 开启 IMU Gz 回传，可加：Serial1.print("{\"N\":106}");
+}
+
+static void startHttp() {
+  server.on("/", HTTP_GET, handle_root);
+  server.on("/mjpeg", HTTP_GET, handle_mjpeg);
+  server.on("/telemetry", HTTP_GET, handle_telemetry);
+  server.on("/cmd", HTTP_POST, handle_cmd);
+  server.begin();
+  Serial.println("[http] server started on port 80");
+}
+
+// --------- setup/loop ---------
+void setup() {
+  Serial.begin(9600);
+  delay(200);
+  Serial.println("[boot] hello");
+
+  bool has_psram = psramFound();  // Arduino-ESP32 提供
+  Serial.printf("[mem] PSRAM: %s\n", has_psram ? "YES" : "NO");
+  Serial1.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+
+  if (!init_camera()) {
+    Serial.println("[camera] init failed. Check pin map.");
+  }
+
+  // if (init_camera()) {
+  //   sensor_t* s = esp_camera_sensor_get();
+  //   if (s) {
+  //     s->set_vflip(s, 1);    // 垂直翻转
+  //     s->set_hmirror(s, 1);   // 水平镜像
+  //     // s->set_contrast(s, 2);    // 提高对比度
+  //     delay(50);
+  //     s->set_framesize(s, CAM_FRAME_SIZE); // “重申一次”帧尺寸
+  //     delay(50);
+  //     // 根据实际效果尝试 (1,0)、(0,1)、(0,0)
+  //   }
+  // }
+
+  WiFi.mode(WIFI_AP);
+  bool ok = WiFi.softAP(AP_SSID, AP_PASS);   // 无密码可用 WiFi.softAP(AP_SSID)
+  Serial.printf("[wifi] AP %s  SSID=\"%s\"  PASS=\"%s\"\n", ok ? "OK" : "FAIL", AP_SSID, AP_PASS);
+  Serial.printf("[wifi] AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+
+  startHttp();
+}
+
+void loop() {
+  server.handleClient();
+  uartPollRead();
+  uartPeriodicPoll();
+}
+
+// void loop() {
+//   static uint32_t t = 0;
+//   if (millis() - t > 1000) {
+//     t = millis();
+//     Serial.println("tick");       // 每秒一行
+//   }
+// }
